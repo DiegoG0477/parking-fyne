@@ -2,191 +2,123 @@ package models
 
 import (
 	"fmt"
-	"image/color"
 	"math"
 	"math/rand"
 	"sync"
 	"time"
 )
 
-var (
-	White          = color.RGBA{R: 255, G: 255, B: 255, A: 255}
-	Black          = color.RGBA{R: 30, G: 30, B: 30, A: 255}
-	mutexExitEnter sync.Mutex
-)
-
 const (
 	lambda         = 2.0
-	MaxWait    int = 10
-	MaxParking int = 20
+	MaxWait        = 10
+	MaxParking     = 20
+	MinParkingTime = 3 * time.Second
+	MaxParkingTime = 5 * time.Second
 )
 
 type Parking struct {
-	waitCars            []*Vehicle
-	parking             [MaxParking]*Vehicle
-	entrace             *Vehicle
-	exit                *Vehicle
-	out                 *Vehicle
-	semQuit             chan bool
-	semRenderNewCarWait chan bool
+	waitCars       []*Vehicle
+	parking        [MaxParking]*Vehicle
+	entranceChan   chan *Vehicle //channel for entrance vehicles
+	exitChan       chan *Vehicle //channel for exiting vehicles
+	mu             sync.Mutex
+	spaceAvailable *sync.Cond
 }
 
-func NewParking(sENCW chan bool, sQ chan bool) *Parking {
-	parking := &Parking{
-		semRenderNewCarWait: sENCW,
-		semQuit:             sQ,
+func NewParking() *Parking {
+	p := &Parking{
+		entranceChan: make(chan *Vehicle),
+		exitChan:     make(chan *Vehicle),
 	}
-	return parking
+	p.spaceAvailable = sync.NewCond(&p.mu)
+	return p
 }
 
-func (p *Parking) MakeParking() {
-	for i := range p.parking {
-		car := NewSpaceVehicle()
-		p.parking[i] = car
+func (p *Parking) Run() {
+	go p.handleEntrance()
+	go p.handleExit()
+	go p.generateVehicles()
+}
+
+func (p *Parking) handleEntrance() {
+	for car := range p.entranceChan {
+		p.mu.Lock()
+		if len(p.waitCars) < MaxWait {
+			p.waitCars = append(p.waitCars, car)
+			fmt.Printf("Vehículo %d añadido a la cola de espera\n", car.ID)
+			p.tryToParkVehicle()
+		}
+		p.mu.Unlock()
 	}
 }
 
-func (p *Parking) MakeOutStation() *Vehicle {
-	p.out = NewSpaceVehicle()
-	return p.out
+func (p *Parking) handleExit() {
+	for car := range p.exitChan {
+		p.mu.Lock()
+		p.removeCarFromParking(car)
+		fmt.Printf("Vehículo %d salió del estacionamiento\n", car.ID)
+		p.spaceAvailable.Broadcast()
+		p.mu.Unlock()
+	}
 }
 
-func (p *Parking) MakeExitStation() *Vehicle {
-	p.exit = NewSpaceVehicle()
-	return p.exit
-}
-
-func (p *Parking) MakeEntraceStation() *Vehicle {
-	p.entrace = NewSpaceVehicle()
-	return p.entrace
-}
-
-func (p *Parking) GenerateCars() {
-	i := 20
+func (p *Parking) generateVehicles() {
+	id := 1
 	for {
-		select {
-		case <-p.semQuit:
-			fmt.Printf("GenerateCars Close")
-			return
-		default:
-			interarrivalTime := -math.Log(1-rand.Float64()) / lambda
-			time.Sleep(time.Duration(interarrivalTime * float64(time.Second)))
-			if len(p.waitCars) < MaxWait {
-				car := NewVehicle(i, p.semQuit)
-				i++
-				p.waitCars = append(p.waitCars, car)
-				p.semRenderNewCarWait <- true
-			}
+		interarrivalTime := -math.Log(1-rand.Float64()) / lambda
+		time.Sleep(time.Duration(interarrivalTime * float64(time.Second)))
+		car := NewVehicle(id)
+		id++
+		p.entranceChan <- car
+	}
+}
+
+func (p *Parking) tryToParkVehicle() {
+	for len(p.waitCars) > 0 {
+		index := p.findEmptyParkingSpace()
+		if index != -1 {
+			car := p.waitCars[0]
+			p.waitCars = p.waitCars[1:]
+			p.parking[index] = car
+			fmt.Printf("Vehículo %d estacionado en espacio %d\n", car.ID, index)
+
+			go func(c *Vehicle, idx int) {
+				time.Sleep(c.parkTime)
+				p.exitChan <- c
+			}(car, index)
+		} else {
+			p.spaceAvailable.Wait()
 		}
 	}
 }
 
-func (p *Parking) CheckParking() {
-	for {
-		select {
-		case <-p.semQuit:
-			fmt.Printf("CheckParking Close")
-			return
-		default:
-			index := p.SearchSpace()
-			if index != -1 && !p.WaitCarsIsEmpty() {
-				mutexExitEnter.Lock()
-				p.MoveToEntrace()
-				p.MoveToPark(index)
-				mutexExitEnter.Unlock()
-			}
-		}
-	}
-}
-
-func (p *Parking) MoveToEntrace() {
-	car := p.PopWaitCars()
-	p.entrace.ReplaceData(car)
-	time.Sleep(1 * time.Second)
-}
-
-func (p *Parking) MoveToPark(index int) {
-	p.parking[index].ReplaceData(p.entrace)
-
-	p.entrace.ReplaceData(NewSpaceVehicle())
-	go p.parking[index].StartCount(index)
-	time.Sleep(1 * time.Second)
-
-}
-
-func (p *Parking) OutCarToExit() {
-	for {
-		select {
-		case <-p.semQuit:
-			fmt.Printf("CarExit Close")
-			return
-		default:
-			if !WaitExitVehiclesIsEmpty() {
-				mutexExitEnter.Lock()
-				car := PopExitWaitVehicles()
-
-				p.MoveToExit(car.ID)
-				p.MoveToOut()
-				mutexExitEnter.Unlock()
-
-				time.Sleep(1 * time.Second)
-				p.out.ReplaceData(NewSpaceVehicle())
-			}
-		}
-	}
-}
-
-func (p *Parking) MoveToExit(index int) {
-	p.exit.ReplaceData(p.parking[index])
-	p.parking[index].ReplaceData(NewSpaceVehicle())
-	time.Sleep(1 * time.Second)
-}
-
-func (p *Parking) MoveToOut() {
-	p.out.ReplaceData(p.exit)
-	p.exit.ReplaceData(NewSpaceVehicle())
-	time.Sleep(1 * time.Second)
-}
-
-func (p *Parking) SearchSpace() int {
-	for s := range p.parking {
-		if p.parking[s].GetID() == -1 {
-			return s
+func (p *Parking) findEmptyParkingSpace() int {
+	for i, spot := range p.parking {
+		if spot == nil {
+			return i
 		}
 	}
 	return -1
 }
 
-func (p *Parking) PopWaitCars() *Vehicle {
-	car := p.waitCars[0]
-	if !p.WaitCarsIsEmpty() {
-		p.waitCars = p.waitCars[1:]
+func (p *Parking) removeCarFromParking(car *Vehicle) {
+	for i, v := range p.parking {
+		if v != nil && v.ID == car.ID {
+			p.parking[i] = nil
+			fmt.Printf("Vehículo %d ha dejado el espacio %d\n", car.ID, i)
+			return
+		}
 	}
-	return car
 }
 
-func (p *Parking) WaitCarsIsEmpty() bool {
-	return len(p.waitCars) == 0
-}
-
-func (p *Parking) GetWaitCars() []*Vehicle {
-	return p.waitCars
-}
-
-func (p *Parking) GetEntraceCar() *Vehicle {
-	return p.entrace
-}
-
-func (p *Parking) GetExitCar() *Vehicle {
-	return p.exit
-}
-
-func (p *Parking) GetParking() [MaxParking]*Vehicle {
+func (p *Parking) GetParkingStatus() [MaxParking]*Vehicle {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.parking
 }
 
-func (p *Parking) ClearParking() {
-	for i := range p.parking {
-		p.parking[i] = nil
-	}
+func (p *Parking) GetWaitCars() []*Vehicle {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.waitCars
 }
